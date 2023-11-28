@@ -1,0 +1,11 @@
+[package]
+name = "deputy-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+syn = { version = "2.0.39", features = ["extra-traits", "full"] }
+quote = "^1.0"
+proc-macro2 = "^1.0.36"
+async-trait = "0.1.74"
+
