@@ -12,6 +12,7 @@ pub struct MacroConfig {
     new_struct_name: Path,
     delegate_name: Path,
     result_types: Vec<Ident>,
+    log_level: Ident,
 }
 
 impl MacroConfig {
@@ -19,7 +20,8 @@ impl MacroConfig {
         Self {
             new_struct_name,
             delegate_name,
-            result_types: Self::default_result_types()
+            result_types: Self::default_result_types(),
+            log_level: Self::default_log_level(),
         }
     }
 
@@ -27,11 +29,19 @@ impl MacroConfig {
         vec![syn::parse2(quote!(Result)).unwrap()]
     }
 
+    fn default_log_level() -> Ident {
+        syn::parse2(quote!(error)).unwrap()
+    }
+
     fn with_result_types(self, result_types: Vec<Ident>) -> Self {
         Self {
             result_types,
             ..self
         }
+    }
+
+    fn with_log_level(self, log_level: Ident) -> Self {
+        Self { log_level, ..self }
     }
 }
 
@@ -53,6 +63,7 @@ enum ExpectedType {
     ResultTypesArray,
     NameValueList,
     ResultType,
+    LogLevel,
 }
 
 impl std::fmt::Display for ExpectedType {
@@ -62,6 +73,7 @@ impl std::fmt::Display for ExpectedType {
             ExpectedType::ResultTypesArray => write!(f, "array of result types such as `[MyResult, Result]`"),
             ExpectedType::NameValueList => write!(f, "a comma separated list of name value pairs such as `result_type = [MyResult, Result]`"),
             ExpectedType::ResultType => write!(f, "a type representing a result such as `MyResult`"),
+            ExpectedType::LogLevel => write!(f, "a type representing a result such as `info`, or `error`"),
         }
     }
 }
@@ -75,6 +87,7 @@ impl Parse for MacroConfig {
         for meta in details {
             config = match OptionalConfig::try_from(meta)? {
                 OptionalConfig::RessultType(result_types) => config.with_result_types(result_types),
+                OptionalConfig::LogLevel(level) => config.with_log_level(level),
             };
         }
 
@@ -84,14 +97,20 @@ impl Parse for MacroConfig {
 
 enum OptionalConfig {
     RessultType(Vec<Ident>),
+    LogLevel(Ident),
 }
 
 impl OptionalConfig {
+    const RESULT_TYPE: &str = "result_types";
+    const LOG_LEVEL: &str = "log_level";
+    const SUPPORTED_CONFIG_OPTIONS: [&str; 2] = [Self::RESULT_TYPE, Self::LOG_LEVEL];
+
     fn array_expr_to_idents(expr: Expr) -> Result<Vec<Ident>, ParseError> {
         match expr {
-            Expr::Array(ExprArray { elems, .. }) => {
-                elems.into_iter().map(Self::ensure_result_type).collect()
-            }
+            Expr::Array(ExprArray { elems, .. }) => elems
+                .into_iter()
+                .map(|expr| Self::ensure_ident(expr, ExpectedType::ResultType))
+                .collect(),
             _ => Err(ParseError::UnexpectedType(
                 Box::new(expr),
                 ExpectedType::ResultTypesArray,
@@ -99,15 +118,12 @@ impl OptionalConfig {
         }
     }
 
-    fn ensure_result_type(expr: Expr) -> Result<Ident, ParseError> {
+    fn ensure_ident(expr: Expr, expected_type: ExpectedType) -> Result<Ident, ParseError> {
         match expr {
             Expr::Path(ExprPath { path, .. }) => path.last_segment_ident().ok_or(
                 ParseError::UnexpectedType(Box::new(path), ExpectedType::ResultType),
             ),
-            _ => Err(ParseError::UnexpectedType(
-                Box::new(expr),
-                ExpectedType::ResultType,
-            )),
+            _ => Err(ParseError::UnexpectedType(Box::new(expr), expected_type)),
         }
     }
 }
@@ -133,13 +149,17 @@ impl TryFrom<Meta> for OptionalConfig {
                 Ok(ident) => {
                     let ident_name = ident.to_string();
                     match ident_name.as_str() {
-                        "result_types" => {
+                        OptionalConfig::RESULT_TYPE => {
                             let details = OptionalConfig::array_expr_to_idents(value)?;
                             Ok(OptionalConfig::RessultType(details))
                         }
+                        OptionalConfig::LOG_LEVEL => {
+                            let details = OptionalConfig::ensure_ident(value, ExpectedType::LogLevel)?;
+                            Ok(OptionalConfig::LogLevel(details))
+                        }
                         _ => Err(ParseError::UnknownOptionalConfig(
                             Box::new(path),
-                            ident_name,
+                            format!("Unknown configuration option {ident_name}, available options: {:?}", Self::SUPPORTED_CONFIG_OPTIONS),
                         )),
                     }
                 }
@@ -174,12 +194,12 @@ impl TraitDefinition {
         &self.0.ident
     }
 
-    fn impl_methods(&self, result_types: &[Ident]) -> TokenStream {
+    fn impl_methods(&self, config: &MacroConfig) -> TokenStream {
         self.0
             .items
             .iter()
             .filter_map(|item| match item {
-                TraitItem::Fn(method) => Some(Self::function_definition(method, result_types)),
+                TraitItem::Fn(method) => Some(Self::function_definition(method, config)),
                 _ => None,
             })
             .collect()
@@ -189,7 +209,7 @@ impl TraitDefinition {
         self.0.to_token_stream()
     }
 
-    fn function_definition(function: &TraitItemFn, result_types: &[Ident]) -> TokenStream {
+    fn function_definition(function: &TraitItemFn, config: &MacroConfig) -> TokenStream {
         let signature = function.sig.to_token_stream();
         let method_name = &function.sig.ident;
         let args: Punctuated<_, Comma> = function
@@ -202,8 +222,9 @@ impl TraitDefinition {
             })
             .collect();
         let maybe_async = function.sig.asyncness.map(|_| quote!(.await));
+        let log_level = &config.log_level;
 
-        if Self::is_fallible(&function.sig.output, result_types) {
+        if Self::is_fallible(&function.sig.output, &config.result_types) {
             quote!(
                 #signature {
                     use tap::TapFallible;
@@ -211,7 +232,7 @@ impl TraitDefinition {
                         .#method_name(#args)
                         #maybe_async
                         .tap_err(|error| {
-                            tracing::error!(?error, "Error calling {}", stringify!(#method_name))
+                            tracing::#log_level!(?error, "Error calling {}", stringify!(#method_name))
                         })
                 }
             )
@@ -271,12 +292,13 @@ pub fn deputy(
     macro_config: MacroConfig,
     trait_definition: TraitDefinition,
 ) -> Result<TokenStream, &'static str> {
-    let new_struct_name = macro_config.new_struct_name;
-    let delegate_name = macro_config.delegate_name;
     let trait_name = trait_definition.name();
     let original_trait = trait_definition.to_token_stream();
-    let impl_methods = trait_definition.impl_methods(&macro_config.result_types);
+    let impl_methods = trait_definition.impl_methods(&macro_config);
     let maybe_async_trait = trait_definition.maybe_async_trait();
+
+    let new_struct_name = macro_config.new_struct_name;
+    let delegate_name = macro_config.delegate_name;
 
     Ok(quote! {
         #original_trait
@@ -339,12 +361,38 @@ mod test {
         .unwrap();
 
         assert_eq!(
-            trait_definition.impl_methods(&MacroConfig::default_result_types()).to_string(),
+            trait_definition
+                .impl_methods(&MacroConfig::default())
+                .to_string(),
             quote!(
                 fn method(&self, key: String) -> Result<(), &'static str> {
                     use tap::TapFallible;
                     self.0.method(key).tap_err(|error| {
                         tracing::error!(?error, "Error calling {}", stringify!(method))
+                    })
+                }
+            )
+            .to_string()
+        );
+    }
+
+    #[test]
+    fn impl_methods_test_fallible_custom_level() {
+        let trait_definition: TraitDefinition = syn::parse2(quote!(
+            trait MyTrait {
+                fn method(&self, key: String) -> Result<(), &'static str>;
+            }
+        ))
+        .unwrap();
+        let config = MacroConfig::default().with_log_level(syn::parse2(quote!(info)).unwrap());
+
+        assert_eq!(
+            trait_definition.impl_methods(&config).to_string(),
+            quote!(
+                fn method(&self, key: String) -> Result<(), &'static str> {
+                    use tap::TapFallible;
+                    self.0.method(key).tap_err(|error| {
+                        tracing::info!(?error, "Error calling {}", stringify!(method))
                     })
                 }
             )
@@ -362,7 +410,9 @@ mod test {
         .unwrap();
 
         assert_eq!(
-            trait_definition.impl_methods(&MacroConfig::default_result_types()).to_string(),
+            trait_definition
+                .impl_methods(&MacroConfig::default())
+                .to_string(),
             quote!(
                 fn method(&self, key: String) -> &'static str {
                     self.0.method(key)
@@ -382,7 +432,9 @@ mod test {
         .unwrap();
 
         assert_eq!(
-            trait_definition.impl_methods(&MacroConfig::default_result_types()).to_string(),
+            trait_definition
+                .impl_methods(&MacroConfig::default())
+                .to_string(),
             quote!(
                 async fn method(&self, key: String) -> Result<(), &'static str> {
                     use tap::TapFallible;
@@ -405,7 +457,9 @@ mod test {
         .unwrap();
 
         assert_eq!(
-            trait_definition.impl_methods(&MacroConfig::default_result_types()).to_string(),
+            trait_definition
+                .impl_methods(&MacroConfig::default())
+                .to_string(),
             quote!(
                 async fn method(&self, key: String) -> &'static str {
                     self.0.method(key).await
@@ -424,10 +478,11 @@ mod test {
             }
         ))
         .unwrap();
-        let custom_result_types = vec![syn::parse2(quote!(MyResult)).unwrap()];
+        let config =
+            MacroConfig::default().with_result_types(vec![syn::parse2(quote!(MyResult)).unwrap()]);
 
         assert_eq!(
-            trait_definition.impl_methods(&custom_result_types).to_string(),
+            trait_definition.impl_methods(&config).to_string(),
             quote!(
                 async fn method1(&self, key: String) -> MyResult<(), &'static str> {
                     use tap::TapFallible;
@@ -444,5 +499,14 @@ mod test {
             )
             .to_string()
         );
+    }
+
+    impl Default for MacroConfig {
+        fn default() -> Self {
+            let delegate_name = syn::parse2(quote!(MyType)).unwrap();
+            let new_type = syn::parse2(quote!(MyLoggingType)).unwrap();
+
+            Self::new(new_type, delegate_name)
+        }
     }
 }

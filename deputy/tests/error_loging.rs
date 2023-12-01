@@ -47,7 +47,7 @@ impl MyAsyncTrait for MyAsyncType {
 
 type MyResult<T> = Result<T, String>;
 
-#[deputy(CustomResultType, CustomLoggingResultType, result_types = [MyResult])]
+#[deputy(CustomResultType, CustomLoggingResultType, result_types = [MyResult], log_level = info)]
 #[async_trait]
 trait CustomResultTrait {
     async fn fallible_async(&self, arg1: String, arg2: &'static str) -> MyResult<&'static str>;
@@ -115,7 +115,9 @@ async fn can_call_method_custom_result() {
 
     assert_eq!(result, Ok("Ok"));
     assert_eq!(
-        logging_type.fallible_async(String::from("Error"), "Ok").await,
+        logging_type
+            .fallible_async(String::from("Error"), "Ok")
+            .await,
         Ok("Ok")
     );
 
@@ -124,7 +126,9 @@ async fn can_call_method_custom_result() {
 
     assert_eq!(result, Err("Error".to_owned()));
     assert_eq!(
-        logging_type.fallible_async(String::from("Error"), "Ok").await,
+        logging_type
+            .fallible_async(String::from("Error"), "Ok")
+            .await,
         Err("Error".to_owned())
     );
 }
